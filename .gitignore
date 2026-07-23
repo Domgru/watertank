@@ -67,3 +67,7 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Ignore local Wi-Fi credentials
+watertank_control/credentials.h
+

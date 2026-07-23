@@ -5,8 +5,10 @@
 #include <Preferences.h>
 #include <time.h>
 
-const char* ssid = "ssid";
-const char* password = "password";
+#include "credentials.h"
+
+const char* ssid = SECRET_SSID;
+const char* password = SECRET_PASSWORD;
 
 const int RELAY_PIN = 15;
 const int TRIG_PIN = 13;
@@ -42,14 +44,19 @@ float limitEmpty = 76.0;  // level at which the tank is considered to be empty m
 float limitFull = 30.0;   // level at which the tank is considered to be full. The sensor has a blind zone of 20-25cm. So we take 30 to be safe.
 int fillCounter = 0;
 
+const float limitEmpty = 76.0;            // Pump starts at 76 cm distance
+const float limitFull = 30.0;             // Post-run triggers at 30 cm distance
+
+int fillCounter = 0;
+
 // time management and "security" max-time
 unsigned long pumpStartTime = 0;
-unsigned long maxRunTime = 600000;  // 10 minutes in milli-sec
+const unsigned long maxRunTime = 600000;  // 10 minutes in milli-sec
 
-bool isOverrunning = false;
-unsigned long overrunStartTime = 0;
+bool isPostRunning = false;
+unsigned long postRunStartTime = 0;
 // 90 seconds - in the automatich mode already 62 cm (92-30) have been filled and 14 cm are missing to max level 76 cm. The pump fills constantly 46,6 cm in 301 seconds which was measured manually.
-unsigned long overrunDuration = 90000;
+const unsigned long postRunDuration = 90000;
 
 unsigned long lastMeasurement = 0;
 unsigned long measureInterval = 60000;  // 60 seconds
@@ -81,7 +88,7 @@ int totalHistoryCount = 0;
 String getFormattedTime() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
-    Serial.println("[NTP] Locale time not yet ready!");
+    Serial.println("[NTP] Locale time not available yet!");
     return "Syncing...";
   }
   char timeStringBuff[30];
@@ -188,7 +195,7 @@ const char INDEX_HTML[] PROGMEM = R"=====(
         <div class="status-box">
             Sensor Distance: <span id="dist" class="highlight">-- cm</span><br>
             Pump Status: <span id="status" class="highlight">--</span><br>
-            Total Fill Cycles: <span id="counter" class="highlight">--</span>
+            Fill Cycles (Since Boot): <span id="counter" class="highlight">--</span>
         </div>
 
         <div class="history-box">
@@ -208,16 +215,16 @@ const char INDEX_HTML[] PROGMEM = R"=====(
         </div>
 
         <div class="cfg-group">
-            <h3>Adjust Configuration</h3>
+            <h3>Active Configuration (Locked)</h3>
             <label>Pump ON (Empty Limit):</label>
-            <input type="number" id="inp_empty" step="1"> cm<br><br>
+            <input type="number" id="inp_empty" readonly style="background:#eee; color:#666; cursor:not-allowed;"> cm<br><br>
             <label>Pump OFF (Full Limit):</label>
-            <input type="number" id="inp_full" step="1"> cm<br><br>
-            <label>Pump Overrun Time:</label>
-            <input type="number" id="inp_overrun" step="1"> sec.<br><br>
+            <input type="number" id="inp_full" readonly style="background:#eee; color:#666; cursor:not-allowed;"> cm<br><br>
+            <label>Pump Post-Run Time:</label>
+            <input type="number" id="inp_postrun" readonly style="background:#eee; color:#666; cursor:not-allowed;"> sec.<br><br>
             <label>Max Run Time (Timeout):</label>
-            <input type="number" id="inp_maxrun" step="1"> min.
-            <button class="btn btn-save" onclick="saveLimits()">Save Settings</button>
+            <input type="number" id="inp_maxrun" readonly style="background:#eee; color:#666; cursor:not-allowed;"> min.
+            <!-- Save Button removed since settings are permanent -->
             <div style="clear:both;"></div>
         </div>
         
@@ -233,12 +240,12 @@ const char INDEX_HTML[] PROGMEM = R"=====(
             fetch('/api/data')
             .then(res => res.json())
             .then(data => {
-                document.getElementById('dist').innerText = data.isOverrunning ? "Blind Zone (Overrun)" : data.distance.toFixed(1) + " cm";
+                document.getElementById('dist').innerText = data.isPostRunning ? "Blind Zone (Post-Run)" : data.distance.toFixed(1) + " cm";
                 document.getElementById('counter').innerText = data.counter;
                 document.getElementById('test_indicator').style.display = data.isTest ? "block" : "none";
                 
-                if (data.isOverrunning) {
-                    document.getElementById('status').innerText = "OVERRUN (Filling...)";
+                if (data.isPostRunning) {
+                    document.getElementById('status').innerText = "POST-RUN (Filling...)";
                     document.getElementById('status').style.color = "orange";
                     document.getElementById('tank_bar').style.width = "100%";
                     document.getElementById('tank_percent').innerText = "Level: Filling remaining volume...";
@@ -257,7 +264,7 @@ const char INDEX_HTML[] PROGMEM = R"=====(
                 if(!initialFieldsLoaded) {
                     document.getElementById('inp_empty').value = data.limitEmpty;
                     document.getElementById('inp_full').value = data.limitFull;
-                    document.getElementById('inp_overrun').value = data.overrunSec;
+                    document.getElementById('inp_postrun').value = data.postRunSec;
                     document.getElementById('inp_maxrun').value = data.maxRunMin;
                     initialFieldsLoaded = true; 
                 }
@@ -266,7 +273,7 @@ const char INDEX_HTML[] PROGMEM = R"=====(
                     let html = "";
                     data.history.forEach(row => {
                         let displayTime = row.time;
-                        if (displayTime === "Synchronisiere Zeit...") {
+                        if (displayTime === "Syncing time...") {
                             displayTime = "Syncing time...";
                         }
                         html += `<tr>
@@ -277,24 +284,6 @@ const char INDEX_HTML[] PROGMEM = R"=====(
                     });
                     document.getElementById('history_body').innerHTML = html;
                 }
-            });
-        }
-
-        function saveLimits() {
-            var emp = document.getElementById('inp_empty').value;
-            var ful = document.getElementById('inp_full').value;
-            var ovr = document.getElementById('inp_overrun').value;
-            var maxR = document.getElementById('inp_maxrun').value;
-            fetch('/api/set?empty=' + emp + '&full=' + ful + '&overrun=' + ovr + '&maxrun=' + maxR)
-            .then(res => res.text())
-            .then(txt => { 
-                if (txt === "Alle Einstellungen gespeichert!") {
-                    alert("All settings saved successfully!");
-                } else {
-                    alert(txt);
-                }
-                initialFieldsLoaded = false; 
-                updateData(); 
             });
         }
 
@@ -343,13 +332,7 @@ void setup() {
 
   Serial.begin(115200);
 
-  // Load values from flash
-  preferences.begin("tank-cfg", false);
-  limitEmpty = preferences.getFloat("limEmpty", 150.0);
-  limitFull = preferences.getFloat("limFull", 30.0);
-  fillCounter = preferences.getInt("counter", 0);
-  overrunDuration = preferences.getULong("limOverrun", 20000);  // standard: 20000 ms (20 sec)
-  maxRunTime = preferences.getULong("limMaxRun", 600000);
+  fillCounter = 0;
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -377,7 +360,7 @@ void setup() {
   config.fb_count = 1;
 
   esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) Serial.printf("Camera Error: 0x%x\n", err);
+  if (err != ESP_OK) Serial.printf("Camera init failed: 0x%x\n", err);
 
   // ask for a fixed ip - address
   IPAddress local_IP(192, 168, 29, 19);  // desired IP
@@ -394,22 +377,20 @@ void setup() {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWiFi connected.");
-
   Serial.print("\nWiFi connected! IP-Address: ");
   Serial.println(WiFi.localIP());
 
   configTime(5.5 * 3600, 0, "pool.ntp.org", "time.nist.gov");
   Serial.println("[NTP] Initiated time sync via pool.ntp.org.");
 
-  if (MDNS.begin("watertank")) Serial.println("Get me on http://watertank.local");
+  if (MDNS.begin("watertank")) Serial.println("Accessible at http://watertank.local");
 
-  server.on("/", []() {
+  server.on("/", [&]() {
     server.send_P(200, "text/html", INDEX_HTML);
   });
 
   // URL to START the simulation mode
-  server.on("/test/on", []() {
+  server.on("/test/on", [&]() {
     testModeActive = true;
     simulatedDistance = limitEmpty - 10.0;
 
@@ -417,23 +398,23 @@ void setup() {
     lastMeasurement = 0;
     measureInterval = 1000;  // force immediately fast intervals
 
-    server.send(200, "text/plain", "Simulation mode ACTIVATED. Go back to start page.");
+    server.send(200, "text/plain", "Simulation mode ENABLED. Go back to start page.");
   });
 
   // URL to END the simulation mode
-  server.on("/test/off", []() {
+  server.on("/test/off", [&]() {
     testModeActive = false;
-    isOverrunning = false;
+    isPostRunning = false;
 
     // reset timer to return to real sensor
     lastMeasurement = 0;
     measureInterval = 60000;  // go back to normal standby-mode
 
-    server.send(200, "text/plain", "Simulation mode DEACTIVATED. Go back to start page.");
+    server.send(200, "text/plain", "Simulation mode DISABLED. Go back to start page.");
   });
 
-  server.on("/api/data", []() {
-    if (!isOverrunning) {
+  server.on("/api/data", [&]() {
+    if (!isPostRunning) {
       smoothedDistance = getFilteredDistance();
     }
 
@@ -442,11 +423,11 @@ void setup() {
     json += "\"relay\":" + String(relayState ? "true" : "false") + ",";
     json += "\"limitEmpty\":" + String(limitEmpty) + ",";
     json += "\"limitFull\":" + String(limitFull) + ",";
-    json += "\"overrunSec\":" + String(overrunDuration / 1000) + ",";
+    json += "\"postRunSec\":" + String(postRunDuration / 1000) + ",";
     json += "\"maxRunMin\":" + String(maxRunTime / 60000) + ",";
     json += "\"counter\":" + String(fillCounter) + ",";
     json += "\"isTest\":" + String(testModeActive ? "true" : "false") + ",";
-    json += "\"isOverrunning\":" + String(isOverrunning ? "true" : "false") + ",";
+    json += "\"isPostRunning\":" + String(isPostRunning ? "true" : "false") + ",";
 
     // include the history
     json += "\"history\": [";
@@ -475,37 +456,28 @@ void setup() {
     server.send(200, "application/json", json);
   });
 
-  server.on("/api/set", []() {
-    if (server.hasArg("empty") && server.hasArg("full") && server.hasArg("overrun")) {
-      limitEmpty = server.arg("empty").toFloat();
-      limitFull = server.arg("full").toFloat();
-
-      // Take the input in seconds and convert into milliseconds
-      unsigned long inputSeconds = server.arg("overrun").toInt();
-      overrunDuration = inputSeconds * 1000;
-
-      unsigned long inputMinutes = server.arg("maxrun").toInt();
-      maxRunTime = inputMinutes * 60000;
-
-      preferences.putFloat("limEmpty", limitEmpty);
-      preferences.putFloat("limFull", limitFull);
-      preferences.putULong("limOverrun", overrunDuration);
-      preferences.putULong("limMaxRun", maxRunTime);
-
-      lastMeasurement = 0;
-      server.send(200, "text/plain", "Saved all settings!");
-    } else {
-      server.send(400, "text/plain", "Error. Could not save settings.");
-    }
+  // Flash writing completely disabled
+  server.on("/api/set", [&]() {
+    server.send(403, "text/plain", "Error: Configuration is hard-coded and locked via firmware.");
   });
 
   server.on("/capture", handleCapture);
   server.begin();
   MDNS.addService("http", "tcp", 80);
 
+  Serial.println("[SYS] Warming up ultrasonic sensor buffer over cable lines...");
+  for (int i = 0; i < 15; i++) {
+    getFilteredDistance();
+    delay(150);  // Give ambient noise and electrical echoes room to dissipate
+  }
+
   float initialDist = getFilteredDistance();
   for (int i = 0; i < FILTER_SAMPLES; i++) measurements[i] = initialDist;
   smoothedDistance = initialDist;
+
+  lastMeasurement = millis();
+  measureInterval = 5000;  // First loop-bound automation execution begins in 5 seconds
+  Serial.printf("[SYS] Safe operational baseline established: %.1f cm\n", smoothedDistance);
 }
 
 // --- MAIN LOOP ---
@@ -521,34 +493,34 @@ void loop() {
   if (currentMillis - lastWifiCheck >= WIFI_CHECK_INTERVAL) {
     lastWifiCheck = currentMillis;
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[WiFi] Connection lost! Starting reconnect...");
+      Serial.println("[WiFi] Connection lost! Initiating reconnect...");
       WiFi.disconnect();
       WiFi.begin(ssid, password);
     }
   }
 
-  // 1. check of overrun timer
-  if (relayState && isOverrunning) {
-    if (currentMillis - overrunStartTime >= overrunDuration) {
+  // 1. check of post-run timer
+  if (relayState && isPostRunning) {
+    if (currentMillis - postRunStartTime >= postRunDuration) {
       relayState = false;
-      isOverrunning = false;
+      isPostRunning = false;
       digitalWrite(RELAY_PIN, RELAY_AUS);
       measureInterval = 60000;
-      Serial.println("Overrun done. Pump OFF.");
+      Serial.println("Post-run complete. Pump OFF.");
     }
   }
 
   // 2. safety - keep the pump running at maxRunTime
   if (relayState && (currentMillis - pumpStartTime >= maxRunTime)) {
     relayState = false;
-    isOverrunning = false;
+    isPostRunning = false;
     digitalWrite(RELAY_PIN, RELAY_AUS);
     measureInterval = 60000;
-    Serial.println("EMERGENCY-OFF: Max pump time exceeded!");
+    Serial.println("SAFETY CUT-OFF: Maximum pump runtime exceeded!");
   }
 
   // 3. "normal" auto mode
-  if (!isOverrunning && (currentMillis - lastMeasurement >= measureInterval)) {
+  if (!isPostRunning && (currentMillis - lastMeasurement >= measureInterval)) {
     lastMeasurement = currentMillis;
     smoothedDistance = getFilteredDistance();
 
@@ -565,15 +537,13 @@ void loop() {
       measureInterval = 1000;
 
       fillCounter++;
-      preferences.putInt("counter", fillCounter);
       Serial.println("Tank empty. Pump ON.");
-    } else if (smoothedDistance <= limitFull && relayState) {  // pump continues in overrun mode
-      isOverrunning = true;
-      overrunStartTime = currentMillis;
-      // set interval to very high value (10 minutes) to avoid measurement by the sensor in its blindzone during the overrun
+    } else if (smoothedDistance <= limitFull && relayState) {  // pump continues in post-run mode
+      isPostRunning = true;
+      postRunStartTime = currentMillis;
+      // set interval to very high value (10 minutes) to avoid measurement by the sensor in its blindzone during the post-run
       measureInterval = 600000;  // 10 minutes!
-      Serial.printf("Sensor "full" limit (%.1f cm) reached. Sensor sleeping. Overrun of %lu sec. running...", smoothedDistance, overrunDuration / 1000);
-
+      Serial.printf("Sensor \"full\" limit (%.1f cm) reached. Sensor sleeping. Post-run of %lu sec. running...", smoothedDistance, postRunDuration / 1000);
     }
   }
   delay(2);
