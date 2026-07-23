@@ -2,7 +2,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
-#include <Preferences.h>
 #include <time.h>
 
 #include "credentials.h"
@@ -36,17 +35,16 @@ const int FLASH_LED_PIN = 4;
 #define RELAY_AUS LOW
 
 WebServer server(80);
-Preferences preferences;
 
-// sensor height at: 92 cm, real max fill level = 76 cm
-// limits for normal auto mode
-float limitEmpty = 76.0;  // level at which the tank is considered to be empty measured from the height of the sensor, e.g. if the tank is considered to empty at 16 cm then we caculate this value as 92-16.
-float limitFull = 30.0;   // level at which the tank is considered to be full. The sensor has a blind zone of 20-25cm. So we take 30 to be safe.
-int fillCounter = 0;
+// measured max water level from ground: 78,5 cm
 
-const float limitEmpty = 76.0;  // Pump starts at 76 cm distance
-const float limitFull = 30.0;   // Post-run triggers at 30 cm distance
+const float SENSOR_HEIGHT_FROM_GROUND = 93.7;
+const float PHYSICAL_EMPTY_DISTANCE = 77.7;  // Water level 16 cm is considered empty which is equivalent to a sensor distance of 77,7 cm (93,7 - 16)
+const float PHYSICAL_FULL_DISTANCE = 30.0;   // Minimum sensor distance to water (Full Tank = 100%)
 
+// for demo only:
+float pumpOnTriggerDistance = 77.7;                           // Modifiable in video to trigger pump!
+const float pumpOffTriggerDistance = PHYSICAL_FULL_DISTANCE;  // Locked at physical full
 int fillCounter = 0;
 
 // time management and "security" max-time
@@ -56,15 +54,19 @@ const unsigned long maxRunTime = 600000;  // 10 minutes in milli-sec
 bool isPostRunning = false;
 unsigned long postRunStartTime = 0;
 /* 
- * In the automatich mode already 62 cm (92-30) have been filled and 14 cm are missing to max level 76 cm. 
- * The pump fills constantly 46,6 cm in 301 seconds which was measured manually. Final tests showed there is a minor overflow with 90 seconds post run duration so we take 80.
+ * In the automatich mode already 63,7 cm (93,7-30) have been filled and 14,8 cm are missing to max level 78,5 cm.
+ * The pump fills constantly 46,6 cm in 301 seconds which was measured manually. For 14,8 cm that would mean 95 seconds. We take 80.
+ * Reason: During the filling there are waves in the tank and we already could be higher than 63,7 cm.
 */
 const unsigned long postRunDuration = 80000;
 
 unsigned long lastMeasurement = 0;
-unsigned long measureInterval = 60000;  // 60 seconds
+unsigned long measureInterval;
 float smoothedDistance = 0.0;
 bool relayState = false;
+
+unsigned long lastHistoryLog = 0;
+float lastLoggedPercent = -99.0;
 
 // Wifi reconnect timer
 unsigned long lastWifiCheck = 0;
@@ -79,7 +81,12 @@ bool testModeActive = false;
 float simulatedDistance = 80.0;
 
 struct LogEntry {
-  String timestamp;
+  byte day;
+  byte month;
+  int year;
+  byte hour;
+  byte minute;
+  byte second;
   float levelPercent;
   float distanceCm;
 };
@@ -88,20 +95,24 @@ LogEntry history[HIST_SIZE];
 int historyIndex = 0;
 int totalHistoryCount = 0;
 
-String getFormattedTime() {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    Serial.println("[NTP] Locale time not available yet!");
-    return "Syncing...";
-  }
-  char timeStringBuff[30];
-  strftime(timeStringBuff, sizeof(timeStringBuff), "%d.%m.%Y %H:%M:%S", &timeinfo);
-  return String(timeStringBuff);
-}
-
-
 void addHistoryEntry(float distance, float percent) {
-  history[historyIndex].timestamp = getFormattedTime();
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    history[historyIndex].day    = timeinfo.tm_mday;
+    history[historyIndex].month  = timeinfo.tm_mon + 1;
+    history[historyIndex].year   = timeinfo.tm_year + 1900;
+    history[historyIndex].hour   = timeinfo.tm_hour;
+    history[historyIndex].minute = timeinfo.tm_min;
+    history[historyIndex].second = timeinfo.tm_sec;
+  } else {
+    // Fallback falls NTP noch nicht synchronisiert ist
+    history[historyIndex].day    = 0;
+    history[historyIndex].month  = 0;
+    history[historyIndex].year   = 0;
+    history[historyIndex].hour   = 99; 
+    history[historyIndex].minute = 99;
+    history[historyIndex].second = 99;
+  }
   history[historyIndex].distanceCm = distance;
   history[historyIndex].levelPercent = percent;
 
@@ -112,11 +123,15 @@ void addHistoryEntry(float distance, float percent) {
 float getFilteredDistance() {
   if (testModeActive) {
     if (relayState) {
-      simulatedDistance -= 2.0;
-      if (simulatedDistance < 10.0) simulatedDistance = 10.0;
+      simulatedDistance -= 3.0;
+      if (simulatedDistance < PHYSICAL_FULL_DISTANCE) {
+        simulatedDistance = PHYSICAL_FULL_DISTANCE;
+      }
     } else {
-      simulatedDistance += 0.5;
-      if (simulatedDistance > 180.0) simulatedDistance = 180.0;
+      simulatedDistance += 1.0;
+      if (simulatedDistance > PHYSICAL_EMPTY_DISTANCE) {
+        simulatedDistance = PHYSICAL_EMPTY_DISTANCE;
+      }
     }
     return simulatedDistance;
   }
@@ -128,12 +143,16 @@ float getFilteredDistance() {
   digitalWrite(TRIG_PIN, LOW);
 
   long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-  if (duration == 0) return smoothedDistance;
+  if (duration == 0) return -1.0;
 
   float currentMeasure = (duration * 0.0343) / 2.0;
 
-  if (currentMeasure < 25.0 || currentMeasure > 400.0) {
-    return smoothedDistance;
+  if (currentMeasure > 400.0) {
+    return -1.0;
+  }
+
+  if (currentMeasure < PHYSICAL_FULL_DISTANCE) {
+    currentMeasure = PHYSICAL_FULL_DISTANCE;
   }
 
   measurements[filterIndex] = currentMeasure;
@@ -152,6 +171,38 @@ float getFilteredDistance() {
     smoothedDistance = sum / validCount;
   }
   return smoothedDistance;
+}
+
+float calculateTankPercentage(float currentDistance) {
+  if (currentDistance < 0) return 0.0;
+
+  float percent = ((PHYSICAL_EMPTY_DISTANCE - currentDistance) / (PHYSICAL_EMPTY_DISTANCE - PHYSICAL_FULL_DISTANCE)) * 100.0;
+
+  if (percent > 100.0) percent = 100.0;
+  if (percent < 0.0) percent = 0.0;
+  return percent;
+}
+
+float calculateWaterHeight(float currentDistance) {
+  if (currentDistance < 0) return -1.0;
+
+  float height = SENSOR_HEIGHT_FROM_GROUND - currentDistance;
+  float maxHeight = SENSOR_HEIGHT_FROM_GROUND - PHYSICAL_FULL_DISTANCE;  // limit for maxHeight is 63.7 cm since PHYSICAL_FULL_DISTANCE is 30 cm, hence 93.7 - 30.0 = 63.7 cm
+  if (height > maxHeight) return maxHeight;
+  if (height < 0.0) return 0.0;
+  return height;
+}
+
+unsigned long getPostRunRemainingSeconds() {
+  if (!relayState || !isPostRunning) {
+    return 0;
+  }
+  unsigned long timeElapsed = millis() - postRunStartTime;
+  if (timeElapsed < postRunDuration) {
+    // Add 999ms to round up to full seconds before the division
+    return ((postRunDuration - timeElapsed) + 999) / 1000;
+  }
+  return 0;
 }
 
 // HTML
@@ -196,6 +247,10 @@ const char INDEX_HTML[] PROGMEM = R"=====(
         </div>
 
         <div class="status-box">
+            Actual Water Height: <span id="height" class="highlight">-- cm</span><br>
+            <div id="postrun_time_row" style="display: none;">
+                Post-Run Remaining: <span id="postrun_time" class="highlight" style="color: orange;">-- sec.</span><br>
+            </div>
             Sensor Distance: <span id="dist" class="highlight">-- cm</span><br>
             Pump Status: <span id="status" class="highlight">--</span><br>
             Fill Cycles (Since Boot): <span id="counter" class="highlight">--</span>
@@ -220,7 +275,10 @@ const char INDEX_HTML[] PROGMEM = R"=====(
         <div class="cfg-group">
             <h3>Active Configuration (Locked)</h3>
             <label>Pump ON (Empty Limit):</label>
-            <input type="number" id="inp_empty" readonly style="background:#eee; color:#666; cursor:not-allowed;"> cm<br><br>
+            <input type="number" id="inp_empty" step="1" style="background:#fff; color:#000; cursor:text;"> cm
+            <button class="btn btn-save" onclick="saveLimits()">Apply</button>
+            <br><br>
+            
             <label>Pump OFF (Full Limit):</label>
             <input type="number" id="inp_full" readonly style="background:#eee; color:#666; cursor:not-allowed;"> cm<br><br>
             <label>Pump Post-Run Time:</label>
@@ -237,55 +295,77 @@ const char INDEX_HTML[] PROGMEM = R"=====(
     </div>
 
     <script>
-        var initialFieldsLoaded = false; 
+        var initialFieldsLoaded = false;
 
         function updateData() {
             fetch('/api/data')
             .then(res => res.json())
             .then(data => {
-                document.getElementById('dist').innerText = data.isPostRunning ? "Blind Zone (Post-Run)" : data.distance.toFixed(1) + " cm";
-                document.getElementById('counter').innerText = data.counter;
-                document.getElementById('test_indicator').style.display = data.isTest ? "block" : "none";
-                
-                if (data.isPostRunning) {
-                    document.getElementById('status').innerText = "POST-RUN (Filling...)";
-                    document.getElementById('status').style.color = "orange";
-                    document.getElementById('tank_bar').style.width = "100%";
-                    document.getElementById('tank_percent').innerText = "Level: Filling remaining volume...";
-                } else {
-                    document.getElementById('status').innerText = data.relay ? "ACTIVE (Filling)" : "STANDBY / OFF";
-                    document.getElementById('status').style.color = data.relay ? "green" : "red";
-                    
-                    var percent = ((data.limitEmpty - data.distance) / (data.limitEmpty - data.limitFull)) * 100;
-                    if (percent > 100) percent = 100;
-                    if (percent < 0) percent = 0;
-                    
-                    document.getElementById('tank_bar').style.width = percent.toFixed(0) + "%";
-                    document.getElementById('tank_percent').innerText = "Level: " + percent.toFixed(0) + "%";
-                }
+              if (data.distance < 0) {
+                  document.getElementById('postrun_time_row').style.display = "none";
+                  document.getElementById('height').innerText = "Unknown";
+                  document.getElementById('height').style.color = "red";
+                  document.getElementById('dist').innerText = "Hardware Connection Error";
+                  document.getElementById('dist').style.color = "red";
+                  document.getElementById('status').innerText = "SENSOR ERROR";
+                  document.getElementById('status').style.color = "red";
+                  document.getElementById('tank_bar').style.width = "0%";
+                  document.getElementById('tank_percent').innerText = "Level: Unknown (Check Cable)";
+              }
+              else if (data.isPostRunning) {
+                  document.getElementById('postrun_time_row').style.display = "block";
+                  document.getElementById('postrun_time').innerText = data.postRunRemainingSec + " sec.";
+                  document.getElementById('dist').innerText = "Blind Zone (Post-Run)";
+                  document.getElementById('dist').style.color = "#2980b9";
+                  document.getElementById('status').innerText = "POST-RUN (Filling...)";
+                  document.getElementById('status').style.color = "orange";
+                  document.getElementById('tank_bar').style.width = "100%";
+                  document.getElementById('tank_percent').innerText = "Level: Filling remaining volume...";
+              }
+              else {
+                  if (data.isMaxFilled) {
+                      document.getElementById('dist').innerText = "≤ " + data.distance.toFixed(1) + " cm";
+                      document.getElementById('height').innerText = "≥ " + data.waterHeight.toFixed(1) + " cm";
+                  } else {
+                      document.getElementById('dist').innerText = data.distance.toFixed(1) + " cm";
+                      document.getElementById('height').innerText = data.waterHeight.toFixed(1) + " cm";
+                  }
+                  document.getElementById('postrun_time_row').style.display = "none";
+                  document.getElementById('dist').style.color = "#2980b9";
+                  document.getElementById('height').style.color = "#2980b9";
+                  document.getElementById('status').innerText = data.relay ? "ACTIVE (Filling)" : "STANDBY / OFF";
+                  document.getElementById('status').style.color = data.relay ? "green" : "red";
+                  
+                  var percent = data.percent;
+                  document.getElementById('tank_bar').style.width = percent.toFixed(0) + "%";
+                  document.getElementById('tank_percent').innerText = "Level: " + percent.toFixed(0) + "%";
+              }
 
-                if(!initialFieldsLoaded) {
-                    document.getElementById('inp_empty').value = data.limitEmpty;
-                    document.getElementById('inp_full').value = data.limitFull;
-                    document.getElementById('inp_postrun').value = data.postRunSec;
-                    document.getElementById('inp_maxrun').value = data.maxRunMin;
-                    initialFieldsLoaded = true; 
-                }
+              document.getElementById('counter').innerText = data.counter;
+              document.getElementById('test_indicator').style.display = data.isTest ? "block" : "none";
 
-                if (data.history && data.history.length > 0) {
-                    let html = "";
-                    data.history.forEach(row => {
-                        let displayTime = row.time;
-                        if (displayTime === "Syncing time...") {
-                            displayTime = "Syncing time...";
-                        }
-                        html += `<tr>
-                            <td>${displayTime}</td>
-                            <td>${row.dist.toFixed(1)} cm</td>
-                            <td><strong>${row.pct.toFixed(0)}%</strong></td>
+              if(!initialFieldsLoaded) {
+                  document.getElementById('inp_empty').value = data.pumpOnTrigger;
+                  document.getElementById('inp_full').value = data.pumpOffTrigger;
+                  document.getElementById('inp_postrun').value = data.postRunSec;
+                  document.getElementById('inp_maxrun').value = data.maxRunMin;
+                  initialFieldsLoaded = true; 
+              }
+
+              if (data.history && data.history.length > 0) {
+                  let html = "";
+                  data.history.forEach(row => {
+                      let displayTime = row.time;
+                      if (displayTime === "Syncing time...") {
+                          displayTime = "Syncing time...";
+                      }
+                      html += `<tr>
+                          <td>${displayTime}</td>
+                          <td>${row.dist.toFixed(1)} cm</td>
+                          <td><strong>${row.pct.toFixed(0)}%</strong></td>
                         </tr>`;
-                    });
-                    document.getElementById('history_body').innerHTML = html;
+                  });
+                  document.getElementById('history_body').innerHTML = html;
                 }
             });
         }
@@ -294,6 +374,28 @@ const char INDEX_HTML[] PROGMEM = R"=====(
             var img = document.getElementById('stream');
             img.src = '/capture?t=' + new Date().getTime();
             img.style.display = 'block';
+        }
+
+        function saveLimits() {
+            var emp = parseFloat(document.getElementById('inp_empty').value);
+            var full = parseFloat(document.getElementById('inp_full').value);
+
+            if (emp < (full + 2.0)) {
+                alert("Invalid input! The Pump-ON distance (" + emp + " cm) must be greater than the Pump-OFF distance (" + full + " cm) plus 2 cm safety margin.");
+                return;
+            }
+            
+            fetch('/api/set?empty=' + emp)
+            .then(res => res.text())
+            .then(txt => { 
+                if (txt === "Saved all settings!") {
+                    alert("Pump-ON trigger distance updated successfully in RAM!");
+                } else {
+                    alert(txt);
+                }
+                initialFieldsLoaded = false; 
+                updateData(); 
+            });
         }
 
         updateData();
@@ -395,7 +497,7 @@ void setup() {
   // URL to START the simulation mode
   server.on("/test/on", [&]() {
     testModeActive = true;
-    simulatedDistance = limitEmpty - 10.0;
+    simulatedDistance = pumpOnTriggerDistance + 5.0;
 
     // set back timer so the simulation starts immediately
     lastMeasurement = 0;
@@ -417,20 +519,20 @@ void setup() {
   });
 
   server.on("/api/data", [&]() {
-    if (!isPostRunning) {
-      smoothedDistance = getFilteredDistance();
-    }
-
     String json = "{";
     json += "\"distance\":" + String(smoothedDistance) + ",";
+    json += "\"percent\":" + String(calculateTankPercentage(smoothedDistance)) + ",";
+    json += "\"waterHeight\":" + String(calculateWaterHeight(smoothedDistance)) + ",";
     json += "\"relay\":" + String(relayState ? "true" : "false") + ",";
-    json += "\"limitEmpty\":" + String(limitEmpty) + ",";
-    json += "\"limitFull\":" + String(limitFull) + ",";
+    json += "\"pumpOnTrigger\":" + String(pumpOnTriggerDistance) + ",";
+    json += "\"pumpOffTrigger\":" + String(pumpOffTriggerDistance) + ",";
     json += "\"postRunSec\":" + String(postRunDuration / 1000) + ",";
+    json += "\"postRunRemainingSec\":" + String(getPostRunRemainingSeconds()) + ",";
     json += "\"maxRunMin\":" + String(maxRunTime / 60000) + ",";
     json += "\"counter\":" + String(fillCounter) + ",";
     json += "\"isTest\":" + String(testModeActive ? "true" : "false") + ",";
     json += "\"isPostRunning\":" + String(isPostRunning ? "true" : "false") + ",";
+    json += "\"isMaxFilled\":" + String(smoothedDistance <= (PHYSICAL_FULL_DISTANCE + 0.1) ? "true" : "false") + ",";
 
     // include the history
     json += "\"history\": [";
@@ -440,10 +542,20 @@ void setup() {
       for (int i = 0; i < totalHistoryCount; i++) {
         int targetIdx = (historyIndex - 1 - i + HIST_SIZE) % HIST_SIZE;
 
-        // security fallback: should the timestamp still be empty, send a dummy text
-        String displayTime = history[targetIdx].timestamp;
-        if (displayTime == "" || displayTime.length() < 2) {
+        String displayTime;
+        if (history[targetIdx].hour == 99) {
           displayTime = "Syncing time...";
+        } else {
+           char buff[25];
+          // Formatiert das Datum zu: TT.MM.JJJJ HH:MM:SS
+          sprintf(buff, "%02d.%02d.%04d %02d:%02d:%02d", 
+                  history[targetIdx].day, 
+                  history[targetIdx].month, 
+                  history[targetIdx].year, 
+                  history[targetIdx].hour, 
+                  history[targetIdx].minute, 
+                  history[targetIdx].second);
+          displayTime = String(buff);
         }
 
         json += "{";
@@ -459,9 +571,20 @@ void setup() {
     server.send(200, "application/json", json);
   });
 
-  // Flash writing completely disabled
   server.on("/api/set", [&]() {
-    server.send(403, "text/plain", "Error: Configuration is hard-coded and locked via firmware.");
+    if (server.hasArg("empty")) {
+      float incomingValue = server.arg("empty").toFloat();
+      if (incomingValue < (PHYSICAL_FULL_DISTANCE + 2.0)) {
+        server.send(400, "text/plain", "Error: Pump-ON distance must be at least " + String(PHYSICAL_FULL_DISTANCE + 2.0) + " cm!");
+        return;
+      }
+
+      pumpOnTriggerDistance = incomingValue;
+      lastMeasurement = 0;  // Forces new measurement in loop
+      server.send(200, "text/plain", "Saved all settings!");
+    } else {
+      server.send(400, "text/plain", "Error. Missing empty parameter.");
+    }
   });
 
   server.on("/capture", handleCapture);
@@ -528,12 +651,15 @@ void loop() {
     smoothedDistance = getFilteredDistance();
 
     // historization
-    float currentPercent = ((limitEmpty - smoothedDistance) / (limitEmpty - limitFull)) * 100.0;
-    if (currentPercent > 100.0) currentPercent = 100.0;
-    if (currentPercent < 0.0) currentPercent = 0.0;
-    addHistoryEntry(smoothedDistance, currentPercent);
+    float currentPercent = calculateTankPercentage(smoothedDistance);
+    
+    if (abs(currentPercent - lastLoggedPercent) >= 2.0 || (currentMillis - lastHistoryLog >= 300000) || lastLoggedPercent < 0) {
+      addHistoryEntry(smoothedDistance, currentPercent);
+      lastLoggedPercent = currentPercent;
+      lastHistoryLog = currentMillis;
+    }
 
-    if (smoothedDistance >= limitEmpty && !relayState) {
+    if (smoothedDistance >= pumpOnTriggerDistance && !relayState) {
       relayState = true;
       pumpStartTime = currentMillis;
       digitalWrite(RELAY_PIN, RELAY_AN);
@@ -541,12 +667,14 @@ void loop() {
 
       fillCounter++;
       Serial.println("Tank empty. Pump ON.");
-    } else if (smoothedDistance <= limitFull && relayState) {  // pump continues in post-run mode
+      addHistoryEntry(smoothedDistance, currentPercent);
+    } else if (smoothedDistance <= pumpOffTriggerDistance && relayState) {  // pump continues in post-run mode
       isPostRunning = true;
       postRunStartTime = currentMillis;
       // set interval to very high value (10 minutes) to avoid measurement by the sensor in its blindzone during the post-run
       measureInterval = 600000;  // 10 minutes!
       Serial.printf("Sensor \"full\" limit (%.1f cm) reached. Sensor sleeping. Post-run of %lu sec. running...", smoothedDistance, postRunDuration / 1000);
+      addHistoryEntry(smoothedDistance, currentPercent);
     }
   }
   delay(2);
