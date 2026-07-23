@@ -44,8 +44,8 @@ float limitEmpty = 76.0;  // level at which the tank is considered to be empty m
 float limitFull = 30.0;   // level at which the tank is considered to be full. The sensor has a blind zone of 20-25cm. So we take 30 to be safe.
 int fillCounter = 0;
 
-const float limitEmpty = 76.0;            // Pump starts at 76 cm distance
-const float limitFull = 30.0;             // Post-run triggers at 30 cm distance
+const float limitEmpty = 76.0;  // Pump starts at 76 cm distance
+const float limitFull = 30.0;   // Post-run triggers at 30 cm distance
 
 int fillCounter = 0;
 
@@ -55,8 +55,11 @@ const unsigned long maxRunTime = 600000;  // 10 minutes in milli-sec
 
 bool isPostRunning = false;
 unsigned long postRunStartTime = 0;
-// 90 seconds - in the automatich mode already 62 cm (92-30) have been filled and 14 cm are missing to max level 76 cm. The pump fills constantly 46,6 cm in 301 seconds which was measured manually.
-const unsigned long postRunDuration = 90000;
+/* 
+ * In the automatich mode already 62 cm (92-30) have been filled and 14 cm are missing to max level 76 cm. 
+ * The pump fills constantly 46,6 cm in 301 seconds which was measured manually. Final tests showed there is a minor overflow with 90 seconds post run duration so we take 80.
+*/
+const unsigned long postRunDuration = 80000;
 
 unsigned long lastMeasurement = 0;
 unsigned long measureInterval = 60000;  // 60 seconds
