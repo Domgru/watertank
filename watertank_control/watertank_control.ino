@@ -98,18 +98,18 @@ int totalHistoryCount = 0;
 void addHistoryEntry(float distance, float percent) {
   struct tm timeinfo;
   if (getLocalTime(&timeinfo)) {
-    history[historyIndex].day    = timeinfo.tm_mday;
-    history[historyIndex].month  = timeinfo.tm_mon + 1;
-    history[historyIndex].year   = timeinfo.tm_year + 1900;
-    history[historyIndex].hour   = timeinfo.tm_hour;
+    history[historyIndex].day = timeinfo.tm_mday;
+    history[historyIndex].month = timeinfo.tm_mon + 1;
+    history[historyIndex].year = timeinfo.tm_year + 1900;
+    history[historyIndex].hour = timeinfo.tm_hour;
     history[historyIndex].minute = timeinfo.tm_min;
     history[historyIndex].second = timeinfo.tm_sec;
   } else {
     // Fallback falls NTP noch nicht synchronisiert ist
-    history[historyIndex].day    = 0;
-    history[historyIndex].month  = 0;
-    history[historyIndex].year   = 0;
-    history[historyIndex].hour   = 99; 
+    history[historyIndex].day = 0;
+    history[historyIndex].month = 0;
+    history[historyIndex].year = 0;
+    history[historyIndex].hour = 99;
     history[historyIndex].minute = 99;
     history[historyIndex].second = 99;
   }
@@ -313,6 +313,8 @@ const char INDEX_HTML[] PROGMEM = R"=====(
                   document.getElementById('tank_percent').innerText = "Level: Unknown (Check Cable)";
               }
               else if (data.isPostRunning) {
+                  document.getElementById('height').innerText = "≥ " + data.waterHeight.toFixed(1) + " cm";
+                  document.getElementById('height').style.color = "orange";
                   document.getElementById('postrun_time_row').style.display = "block";
                   document.getElementById('postrun_time').innerText = data.postRunRemainingSec + " sec.";
                   document.getElementById('dist').innerText = "Blind Zone (Post-Run)";
@@ -376,8 +378,20 @@ const char INDEX_HTML[] PROGMEM = R"=====(
             img.style.display = 'block';
         }
 
+        function parseAndValidateInput(elementId, fieldName) {
+            var rawValue = document.getElementById(elementId).value.replace(',', '.');
+            var parsedValue = parseFloat(rawValue);
+            if (isNaN(parsedValue) || parsedValue <= 0) {
+                alert("Please provide a valid numeric value for field '" + fieldName + "'!");
+                return null;
+            }
+            return parsedValue;
+        }
+
         function saveLimits() {
-            var emp = parseFloat(document.getElementById('inp_empty').value);
+            var emp = parseAndValidateInput('inp_empty', 'empty limit');
+            if (emp === null) return;
+
             var full = parseFloat(document.getElementById('inp_full').value);
 
             if (emp < (full + 2.0)) {
@@ -546,14 +560,14 @@ void setup() {
         if (history[targetIdx].hour == 99) {
           displayTime = "Syncing time...";
         } else {
-           char buff[25];
+          char buff[25];
           // Formatiert das Datum zu: TT.MM.JJJJ HH:MM:SS
-          sprintf(buff, "%02d.%02d.%04d %02d:%02d:%02d", 
-                  history[targetIdx].day, 
-                  history[targetIdx].month, 
-                  history[targetIdx].year, 
-                  history[targetIdx].hour, 
-                  history[targetIdx].minute, 
+          sprintf(buff, "%02d.%02d.%04d %02d:%02d:%02d",
+                  history[targetIdx].day,
+                  history[targetIdx].month,
+                  history[targetIdx].year,
+                  history[targetIdx].hour,
+                  history[targetIdx].minute,
                   history[targetIdx].second);
           displayTime = String(buff);
         }
@@ -652,7 +666,7 @@ void loop() {
 
     // historization
     float currentPercent = calculateTankPercentage(smoothedDistance);
-    
+
     if (abs(currentPercent - lastLoggedPercent) >= 2.0 || (currentMillis - lastHistoryLog >= 300000) || lastLoggedPercent < 0) {
       addHistoryEntry(smoothedDistance, currentPercent);
       lastLoggedPercent = currentPercent;
