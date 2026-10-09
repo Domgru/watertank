@@ -53,12 +53,9 @@ const unsigned long maxRunTime = 600000;  // 10 minutes in milli-sec
 
 bool isPostRunning = false;
 unsigned long postRunStartTime = 0;
-/* 
- * In the automatich mode already 63,7 cm (93,7-30) have been filled and 14,8 cm are missing to max level 78,5 cm.
- * The pump fills constantly 46,6 cm in 301 seconds which was measured manually. For 14,8 cm that would mean 95 seconds. We take 80.
- * Reason: During the filling there are waves in the tank and we already could be higher than 63,7 cm.
-*/
-const unsigned long postRunDuration = 80000;
+
+// In the automatich mode already 63,7 cm (93,7-30) have been filled and 14,8 cm are missing to max level 78,5 cm. However, even if the pump is switching off the water still is flowing.
+unsigned long postRunDuration = 60000;
 
 unsigned long lastMeasurement = 0;
 unsigned long measureInterval;
@@ -273,16 +270,16 @@ const char INDEX_HTML[] PROGMEM = R"=====(
         </div>
 
         <div class="cfg-group">
-            <h3>Active Configuration (Locked)</h3>
+            <h3>Configuration Values</h3>
             <label>Pump ON (Empty Limit):</label>
-            <input type="number" id="inp_empty" step="1" style="background:#fff; color:#000; cursor:text;"> cm
-            <button class="btn btn-save" onclick="saveLimits()">Apply</button>
+            <input type="number" id="inp_empty" step="1" style="background:#fff; color:#000; cursor:text;"> cm<br><br>
+            <label>Pump Post-Run Time:</label>
+            <input type="number" id="inp_postrun" min="1" step="1" style="background:#fff; color:#000; cursor:text;"> sec.<br><br>
+            <button class="btn btn-save" onclick="saveLimits()">Apply configuration</button>
             <br><br>
             
             <label>Pump OFF (Full Limit):</label>
             <input type="number" id="inp_full" readonly style="background:#eee; color:#666; cursor:not-allowed;"> cm<br><br>
-            <label>Pump Post-Run Time:</label>
-            <input type="number" id="inp_postrun" readonly style="background:#eee; color:#666; cursor:not-allowed;"> sec.<br><br>
             <label>Max Run Time (Timeout):</label>
             <input type="number" id="inp_maxrun" readonly style="background:#eee; color:#666; cursor:not-allowed;"> min.
             <!-- Save Button removed since settings are permanent -->
@@ -378,12 +375,17 @@ const char INDEX_HTML[] PROGMEM = R"=====(
             img.style.display = 'block';
         }
 
-        function parseAndValidateInput(elementId, fieldName) {
+        function parseAndValidateInput(elementId, fieldName, isInteger = false) {
             var rawValue = document.getElementById(elementId).value.replace(',', '.');
-            var parsedValue = parseFloat(rawValue);
+            var parsedValue = Number(rawValue);
+            
             if (isNaN(parsedValue) || parsedValue <= 0) {
                 alert("Please provide a valid numeric value for field '" + fieldName + "'!");
                 return null;
+            }
+            if (isInteger && parsedValue % 1 !== 0) {
+              alert("Field '" + fieldName + "' must be a whole number (no decimals allowed)!");
+              return null;
             }
             return parsedValue;
         }
@@ -391,6 +393,8 @@ const char INDEX_HTML[] PROGMEM = R"=====(
         function saveLimits() {
             var emp = parseAndValidateInput('inp_empty', 'empty limit');
             if (emp === null) return;
+            var postrun = parseAndValidateInput('inp_postrun', 'postrun time', true);
+            if (postrun === null) return;
 
             var full = parseFloat(document.getElementById('inp_full').value);
 
@@ -399,11 +403,11 @@ const char INDEX_HTML[] PROGMEM = R"=====(
                 return;
             }
             
-            fetch('/api/set?empty=' + emp)
+            fetch('/api/set?empty=' + emp + '&postrun=' + postrun)
             .then(res => res.text())
             .then(txt => { 
                 if (txt === "Saved all settings!") {
-                    alert("Pump-ON trigger distance updated successfully in RAM!");
+                    alert("Pump-ON trigger distance and PostrunTime updated successfully in RAM!");
                 } else {
                     alert(txt);
                 }
@@ -586,15 +590,23 @@ void setup() {
   });
 
   server.on("/api/set", [&]() {
-    if (server.hasArg("empty")) {
-      float incomingValue = server.arg("empty").toFloat();
-      if (incomingValue < (PHYSICAL_FULL_DISTANCE + 2.0)) {
+    if (server.hasArg("empty") && server.hasArg("postrun")) {
+      float emptyChangedValue = server.arg("empty").toFloat();
+      if (emptyChangedValue < (PHYSICAL_FULL_DISTANCE + 2.0)) {
         server.send(400, "text/plain", "Error: Pump-ON distance must be at least " + String(PHYSICAL_FULL_DISTANCE + 2.0) + " cm!");
         return;
       }
 
-      pumpOnTriggerDistance = incomingValue;
+      String postrunRaw = server.arg("postrun");
+      unsigned long postrunChangedValue = strtoul(postrunRaw.c_str(), NULL, 10);
+      if (postrunChangedValue == 0) {
+        server.send(400, "text/plain", "Error: Postrun must be greater than 0!");
+        return;
+      }
+
+      pumpOnTriggerDistance = emptyChangedValue;
       lastMeasurement = 0;  // Forces new measurement in loop
+      postRunDuration = postrunChangedValue * 1000;
       server.send(200, "text/plain", "Saved all settings!");
     } else {
       server.send(400, "text/plain", "Error. Missing empty parameter.");
