@@ -445,6 +445,7 @@ void handleCapture() {
 }
 
 void setup() {
+  // 1. Hardware-Pins sofort initialisieren
   digitalWrite(RELAY_PIN, RELAY_AUS);
   pinMode(RELAY_PIN, OUTPUT);
 
@@ -454,9 +455,136 @@ void setup() {
   digitalWrite(FLASH_LED_PIN, LOW);
 
   Serial.begin(115200);
-
+  delay(100); // Kurze Pause zur Stabilisierung der Spannungsversorgung
+  Serial.println("\n[SYS] Booting secure firmware...");
   fillCounter = 0;
 
+  // 2. WLAN SOFORT STARTEN (Verhindert Boot-Loops, falls der Router nach Stromausfall bootet)
+  IPAddress local_IP(192, 168, 29, 199);  // Neue, krisensichere IP
+  IPAddress gateway(192, 168, 29, 1);    // Jio Router
+  IPAddress subnet(255, 255, 255, 0);    
+  IPAddress dns(192, 168, 29, 1);        
+
+  if (!WiFi.config(local_IP, gateway, subnet, dns)) {
+    Serial.println("[WiFi] Fixed IP-Configuration failed!");
+  }
+
+  WiFi.begin(ssid, password);
+  Serial.println("[WiFi] Connecting to Network...");
+  
+  int attempts = 0;
+  // Maximal 15 Sekunden (30 * 500ms) beim Start versuchen, um Hänger zu vermeiden
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("\nWiFi connected! IP-Address: ");
+    Serial.println(WiFi.localIP());
+    configTime(5.5 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+    Serial.println("[NTP] Initiated time sync.");
+    if (MDNS.begin("watertank")) {
+      Serial.println("Accessible at http://watertank.local");
+      MDNS.addService("http", "tcp", 80);
+    }
+  } else {
+    Serial.println("\n[WiFi] Router not ready yet. Continuing boot, will auto-connect in background.");
+  }
+
+  // 3. WEBSERVER-ROUTEN REGISTRIEREN
+  server.on("/", [&]() {
+    server.send_P(200, "text/html", INDEX_HTML);
+  });
+
+  server.on("/test/on", [&]() {
+    testModeActive = true;
+    simulatedDistance = pumpOnTriggerDistance + 5.0;
+    lastMeasurement = 0;
+    measureInterval = 1000;
+    server.send(200, "text/plain", "Simulation mode ENABLED. Go back to start page.");
+  });
+
+  server.on("/test/off", [&]() {
+    testModeActive = false;
+    isPostRunning = false;
+    lastMeasurement = 0;
+    measureInterval = 60000;
+    server.send(200, "text/plain", "Simulation mode DISABLED. Go back to start page.");
+  });
+
+  server.on("/api/data", [&]() {
+    String json = "{";
+    json += "\"distance\":" + String(smoothedDistance) + ",";
+    json += "\"percent\":" + String(calculateTankPercentage(smoothedDistance)) + ",";
+    json += "\"waterHeight\":" + String(calculateWaterHeight(smoothedDistance)) + ",";
+    json += "\"relay\":" + String(relayState ? "true" : "false") + ",";
+    json += "\"pumpOnTrigger\":" + String(pumpOnTriggerDistance) + ",";
+    json += "\"pumpOffTrigger\":" + String(pumpOffTriggerDistance) + ",";
+    json += "\"postRunSec\":" + String(postRunDuration / 1000) + ",";
+    json += "\"postRunRemainingSec\":" + String(getPostRunRemainingSeconds()) + ",";
+    json += "\"maxRunMin\":" + String(maxRunTime / 60000) + ",";
+    json += "\"counter\":" + String(fillCounter) + ",";
+    json += "\"isTest\":" + String(testModeActive ? "true" : "false") + ",";
+    json += "\"isPostRunning\":" + String(isPostRunning ? "true" : "false") + ",";
+    json += "\"isMaxFilled\":" + String(smoothedDistance <= (PHYSICAL_FULL_DISTANCE + 0.1) ? "true" : "false") + ",";
+
+    json += "\"history\": [";
+    if (totalHistoryCount == 0) {
+      json += "";
+    } else {
+      for (int i = 0; i < totalHistoryCount; i++) {
+        int targetIdx = (historyIndex - 1 - i + HIST_SIZE) % HIST_SIZE;
+        String displayTime;
+        if (history[targetIdx].hour == 99) {
+          displayTime = "Syncing time...";
+        } else {
+          char buff[25];
+          sprintf(buff, "%02d.%02d.%04d %02d:%02d:%02d",
+                  history[targetIdx].day, history[targetIdx].month, history[targetIdx].year,
+                  history[targetIdx].hour, history[targetIdx].minute, history[targetIdx].second);
+          displayTime = String(buff);
+        }
+        json += "{";
+        json += "\"time\":\"" + displayTime + "\",";
+        json += "\"dist\":" + String(history[targetIdx].distanceCm) + ",";
+        json += "\"pct\":" + String(history[targetIdx].levelPercent);
+        json += "}";
+        if (i < totalHistoryCount - 1) json += ",";
+      }
+    }
+    json += "]";
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/api/set", [&]() {
+    if (server.hasArg("empty") && server.hasArg("postrun")) {
+      float emptyChangedValue = server.arg("empty").toFloat();
+      if (emptyChangedValue < (PHYSICAL_FULL_DISTANCE + 2.0)) {
+        server.send(400, "text/plain", "Error: Pump-ON distance must be at least " + String(PHYSICAL_FULL_DISTANCE + 2.0) + " cm!");
+        return;
+      }
+      String postrunRaw = server.arg("postrun");
+      unsigned long postrunChangedValue = strtoul(postrunRaw.c_str(), NULL, 10);
+      if (postrunChangedValue == 0) {
+        server.send(400, "text/plain", "Error: Postrun must be greater than 0!");
+        return;
+      }
+      pumpOnTriggerDistance = emptyChangedValue;
+      lastMeasurement = 0;  
+      postRunDuration = postrunChangedValue * 1000;
+      server.send(200, "text/plain", "Saved all settings!");
+    } else {
+      server.send(400, "text/plain", "Error. Missing empty parameter.");
+    }
+  });
+
+  server.on("/capture", handleCapture);
+  server.begin();
+
+  // 4. KAMERA-INITIALISIERUNG (Mit Schutz vor komplettem Systemabsturz)
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -483,154 +611,36 @@ void setup() {
   config.fb_count = 1;
 
   esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) Serial.printf("Camera init failed: 0x%x\n", err);
-
-  // ask for a fixed ip - address
-  IPAddress local_IP(192, 168, 29, 19);  // desired IP
-  IPAddress gateway(192, 168, 29, 1);    // address of Jio router
-  IPAddress subnet(255, 255, 255, 0);    // standard sub net mask
-  IPAddress dns(192, 168, 29, 1);        // DNS server
-
-  if (!WiFi.config(local_IP, gateway, subnet, dns)) {
-    Serial.println("[WiFi] Fixed IP-Configuration failed!");
+  if (err != ESP_OK) {
+    Serial.printf("[CAMERA] Init failed: 0x%x. System keeps running without video!\n", err);
   }
 
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+    Serial.println("[SYS] Pre-filling ultrasonic sensor buffer with empty baseline...");
+  for (int i = 0; i < FILTER_SAMPLES; i++) {
+    measurements[i] = PHYSICAL_EMPTY_DISTANCE; // Puffer sicher mit "Leer-Abstand" vorfüllen
   }
-  Serial.print("\nWiFi connected! IP-Address: ");
-  Serial.println(WiFi.localIP());
 
-  configTime(5.5 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-  Serial.println("[NTP] Initiated time sync via pool.ntp.org.");
-
-  if (MDNS.begin("watertank")) Serial.println("Accessible at http://watertank.local");
-
-  server.on("/", [&]() {
-    server.send_P(200, "text/html", INDEX_HTML);
-  });
-
-  // URL to START the simulation mode
-  server.on("/test/on", [&]() {
-    testModeActive = true;
-    simulatedDistance = pumpOnTriggerDistance + 5.0;
-
-    // set back timer so the simulation starts immediately
-    lastMeasurement = 0;
-    measureInterval = 1000;  // force immediately fast intervals
-
-    server.send(200, "text/plain", "Simulation mode ENABLED. Go back to start page.");
-  });
-
-  // URL to END the simulation mode
-  server.on("/test/off", [&]() {
-    testModeActive = false;
-    isPostRunning = false;
-
-    // reset timer to return to real sensor
-    lastMeasurement = 0;
-    measureInterval = 60000;  // go back to normal standby-mode
-
-    server.send(200, "text/plain", "Simulation mode DISABLED. Go back to start page.");
-  });
-
-  server.on("/api/data", [&]() {
-    String json = "{";
-    json += "\"distance\":" + String(smoothedDistance) + ",";
-    json += "\"percent\":" + String(calculateTankPercentage(smoothedDistance)) + ",";
-    json += "\"waterHeight\":" + String(calculateWaterHeight(smoothedDistance)) + ",";
-    json += "\"relay\":" + String(relayState ? "true" : "false") + ",";
-    json += "\"pumpOnTrigger\":" + String(pumpOnTriggerDistance) + ",";
-    json += "\"pumpOffTrigger\":" + String(pumpOffTriggerDistance) + ",";
-    json += "\"postRunSec\":" + String(postRunDuration / 1000) + ",";
-    json += "\"postRunRemainingSec\":" + String(getPostRunRemainingSeconds()) + ",";
-    json += "\"maxRunMin\":" + String(maxRunTime / 60000) + ",";
-    json += "\"counter\":" + String(fillCounter) + ",";
-    json += "\"isTest\":" + String(testModeActive ? "true" : "false") + ",";
-    json += "\"isPostRunning\":" + String(isPostRunning ? "true" : "false") + ",";
-    json += "\"isMaxFilled\":" + String(smoothedDistance <= (PHYSICAL_FULL_DISTANCE + 0.1) ? "true" : "false") + ",";
-
-    // include the history
-    json += "\"history\": [";
-    if (totalHistoryCount == 0) {
-      json += "";
-    } else {
-      for (int i = 0; i < totalHistoryCount; i++) {
-        int targetIdx = (historyIndex - 1 - i + HIST_SIZE) % HIST_SIZE;
-
-        String displayTime;
-        if (history[targetIdx].hour == 99) {
-          displayTime = "Syncing time...";
-        } else {
-          char buff[25];
-          // Formatiert das Datum zu: TT.MM.JJJJ HH:MM:SS
-          sprintf(buff, "%02d.%02d.%04d %02d:%02d:%02d",
-                  history[targetIdx].day,
-                  history[targetIdx].month,
-                  history[targetIdx].year,
-                  history[targetIdx].hour,
-                  history[targetIdx].minute,
-                  history[targetIdx].second);
-          displayTime = String(buff);
-        }
-
-        json += "{";
-        json += "\"time\":\"" + displayTime + "\",";
-        json += "\"dist\":" + String(history[targetIdx].distanceCm) + ",";
-        json += "\"pct\":" + String(history[targetIdx].levelPercent);
-        json += "}";
-        if (i < totalHistoryCount - 1) json += ",";
-      }
-    }
-    json += "]";
-    json += "}";
-    server.send(200, "application/json", json);
-  });
-
-  server.on("/api/set", [&]() {
-    if (server.hasArg("empty") && server.hasArg("postrun")) {
-      float emptyChangedValue = server.arg("empty").toFloat();
-      if (emptyChangedValue < (PHYSICAL_FULL_DISTANCE + 2.0)) {
-        server.send(400, "text/plain", "Error: Pump-ON distance must be at least " + String(PHYSICAL_FULL_DISTANCE + 2.0) + " cm!");
-        return;
-      }
-
-      String postrunRaw = server.arg("postrun");
-      unsigned long postrunChangedValue = strtoul(postrunRaw.c_str(), NULL, 10);
-      if (postrunChangedValue == 0) {
-        server.send(400, "text/plain", "Error: Postrun must be greater than 0!");
-        return;
-      }
-
-      pumpOnTriggerDistance = emptyChangedValue;
-      lastMeasurement = 0;  // Forces new measurement in loop
-      postRunDuration = postrunChangedValue * 1000;
-      server.send(200, "text/plain", "Saved all settings!");
-    } else {
-      server.send(400, "text/plain", "Error. Missing empty parameter.");
-    }
-  });
-
-  server.on("/capture", handleCapture);
-  server.begin();
-  MDNS.addService("http", "tcp", 80);
-
-  Serial.println("[SYS] Warming up ultrasonic sensor buffer over cable lines...");
+  Serial.println("[SYS] Warming up ultrasonic sensor over cable lines...");
   for (int i = 0; i < 15; i++) {
     getFilteredDistance();
-    delay(150);  // Give ambient noise and electrical echoes room to dissipate
+    delay(150); 
   }
 
   float initialDist = getFilteredDistance();
+  // Wenn der frisch gereinigte Tank Müllwerte liefert oder out-of-range ist, auf leer setzen
+  if (initialDist <= 0 || initialDist > PHYSICAL_EMPTY_DISTANCE) {
+    initialDist = PHYSICAL_EMPTY_DISTANCE;
+    Serial.println("[SYS] Sensor values unstable or tank empty. Set to PHYSICAL_EMPTY_DISTANCE.");
+  }
+
   for (int i = 0; i < FILTER_SAMPLES; i++) measurements[i] = initialDist;
   smoothedDistance = initialDist;
 
   lastMeasurement = millis();
-  measureInterval = 5000;  // First loop-bound automation execution begins in 5 seconds
+  measureInterval = 2000;  // Erste Automatik-Messung startet nach 2 Sekunden
   Serial.printf("[SYS] Safe operational baseline established: %.1f cm\n", smoothedDistance);
 }
+
 
 // --- MAIN LOOP ---
 void loop() {
